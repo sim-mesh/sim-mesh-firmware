@@ -32,11 +32,21 @@ station:
   `competition/meshtastic_firmware` clone at tag `v2.7.26.54e0d8d` with
   `meshtastic/firmware.patch` applied (`git apply`; it adds
   `variants/native/sim-mesh/platformio.ini`): `pio run -e sim-mesh`, then
-  `meshtastic/make_zip.py .pio/build/sim-mesh/meshtasticd`. Besides
-  Portduino's headers it needs `libssl-dev`; `make_zip.py` fetches
-  `grpcio-tools` and the pure-Python `protobuf` from PyPI. `test_host.py`
-  and `test_driver.py` run with sim-mesh's Python environment; the first
-  builds the bindings into `meshtastic/.pylib` once.
+  `meshtastic/make_zip.py .pio/build/sim-mesh/meshtasticd`. The other
+  architecture is the same build with the cross g++
+  (`radio/portduino/README.md`), into a build directory of its own:
+  `SIM_MESH_ARCH=x86_64 PLATFORMIO_BUILD_DIR=.pio/build-x86_64 pio run -e
+  sim-mesh`, then `make_zip.py .pio/build-x86_64/sim-mesh/meshtasticd`.
+  Besides Portduino's headers it needs `libssl-dev`, and for each
+  architecture it builds for, that architecture's `libyaml-cpp-dev`,
+  `libuv1-dev`, `libi2c-dev`, `libusb-1.0-0-dev`, `libssl-dev` and
+  `libgpiod-dev` (`:amd64` on an aarch64 host), since `make_zip.py` puts the
+  libraries meshtasticd loads beyond the C library and C++ runtime (yaml-cpp,
+  libusb, libi2c and theirs) in the zip's `lib/`, from that architecture's
+  multiarch directory. It takes the architecture from the program, and fetches
+  `grpcio-tools` and the pure-Python `protobuf` from PyPI. `test_host.py` and
+  `test_driver.py` run with sim-mesh's Python environment; the first builds
+  the bindings into `meshtastic/.pylib` once.
 - **Sergeyculum**: its `sim-mesh-radio-sys` crate links it by name;
   `cargo build --profile sim` in `fw/sim-mesh`, and
   `cargo build --release -p rncfg` at the top, then its
