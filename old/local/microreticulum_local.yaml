@@ -1,0 +1,7 @@
+# attermann's microReticulum_Firmware as last compiled with `pio run -e sim-mesh` in its
+# clone under competition/ beside sim-mesh: microreticulum_local_latest.
+project: microReticulum (attermann)
+kind: microreticulum
+virtual_hardware: ESP32-S3
+virtual_radio: SX1262
+elf: ../../../competition/attermann_microReticulum_Firmware/.pio/build/sim-mesh/rnode_firmware_native

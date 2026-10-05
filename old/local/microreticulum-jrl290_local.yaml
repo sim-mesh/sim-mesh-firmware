@@ -1,0 +1,11 @@
+# attermann's microReticulum_Firmware with RTNode-HeltecV4's path-request rules carried onto
+# its stack, as last compiled with `pio run -e sim-mesh-jrl290` in its clone under competition/
+# beside sim-mesh: microreticulum-jrl290_local_latest. A stand-in for jrl290's firmware, not
+# that firmware; like it, its LoRa interface runs in full mode.
+project: microReticulum (jrl290 rules)
+kind: microreticulum
+virtual_hardware: ESP32-S3
+virtual_radio: SX1262
+elf: ../../../competition/attermann_microReticulum_Firmware/.pio/build/sim-mesh-jrl290/rnode_firmware_native
+env:
+  MR_LORA_INTERFACE_MODE: full

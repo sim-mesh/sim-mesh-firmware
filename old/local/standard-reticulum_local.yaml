@@ -1,0 +1,12 @@
+# A standard Reticulum node: stations/standard_reticulum/station.py, Reticulum's
+# Python reference implementation and an LXMF router, over the RNode firmware
+# as last compiled with `pio run -e sim-mesh-rnode` in attermann's
+# microReticulum_Firmware clone under competition/ beside sim-mesh:
+# standard-reticulum_local_latest.
+project: Standard Reticulum
+kind: standard_reticulum
+virtual_hardware: ESP32-S3
+virtual_radio: SX1262
+elf: ../../stations/standard_reticulum/station.py
+tools:
+  rnode: ../../../competition/attermann_microReticulum_Firmware/.pio/build/sim-mesh-rnode/rnode_firmware_native

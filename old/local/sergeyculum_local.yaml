@@ -1,0 +1,9 @@
+# Sergeyculum's fw/sim-mesh as last compiled in the reticulum repository beside sim-mesh, with
+# its rncfg: sergeyculum_local_latest, until Sergeyculum publishes a sim-mesh build of its own.
+project: Sergeyculum
+kind: sergeyculum
+virtual_hardware: nRF52840
+virtual_radio: SX1262
+elf: ../../../sergey/reticulum/fw/sim-mesh/target/release/sim-mesh
+tools:
+  rncfg: ../../../sergey/reticulum/target/release/rncfg
