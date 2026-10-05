@@ -1,0 +1,288 @@
+diff --git a/src/Power.cpp b/src/Power.cpp
+index ef1143d02..174f454ef 100644
+--- a/src/Power.cpp
++++ b/src/Power.cpp
+@@ -782,7 +782,14 @@ void Power::reboot()
+         screen = nullptr;
+     }
+     LOG_DEBUG("final reboot!");
++#ifdef SIM_MESH
++    // The station restarts whole: the process that started this one starts it again.
++    fflush(stdout);
++    fflush(stderr);
++    exit(0);
++#else
+     ::reboot();
++#endif
+ #elif defined(ARCH_STM32WL)
+     HAL_NVIC_SystemReset();
+ #else
+diff --git a/src/concurrency/InterruptableDelay.cpp b/src/concurrency/InterruptableDelay.cpp
+index 8bc85436b..c3168961c 100644
+--- a/src/concurrency/InterruptableDelay.cpp
++++ b/src/concurrency/InterruptableDelay.cpp
+@@ -1,6 +1,12 @@
+ #include "concurrency/InterruptableDelay.h"
+ #include "configuration.h"
+ 
++#ifdef SIM_MESH
++// sim-mesh's idle (simradio-portduino): ends on a wake, a DIO1 rise or input on the API's sockets.
++void rnode_idle(uint32_t max_ms);
++void rnode_wake();
++#endif
++
+ namespace concurrency
+ {
+ 
+@@ -13,6 +19,10 @@ InterruptableDelay::~InterruptableDelay() {}
+  */
+ bool InterruptableDelay::delay(uint32_t msec)
+ {
++#ifdef SIM_MESH
++    rnode_idle(msec);
++    return false;
++#else
+     // LOG_DEBUG("delay %u ", msec);
+ 
+     // sem take will return false if we timed out (i.e. were not interrupted)
+@@ -20,16 +30,25 @@ bool InterruptableDelay::delay(uint32_t msec)
+ 
+     // LOG_DEBUG("interrupt=%d", r);
+     return !r;
++#endif
+ }
+ 
+ void InterruptableDelay::interrupt()
+ {
++#ifdef SIM_MESH
++    rnode_wake();
++#else
+     semaphore.give();
++#endif
+ }
+ 
+ IRAM_ATTR void InterruptableDelay::interruptFromISR(BaseType_t *pxHigherPriorityTaskWoken)
+ {
++#ifdef SIM_MESH
++    rnode_wake();
++#else
+     semaphore.giveFromISR(pxHigherPriorityTaskWoken);
++#endif
+ }
+ 
+-} // namespace concurrency
+\ No newline at end of file
++} // namespace concurrency
+diff --git a/src/main.cpp b/src/main.cpp
+index 084dd2914..7f925948b 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -75,7 +75,11 @@ NRF52Bluetooth *nrf52Bluetooth = nullptr;
+ 
+ #ifdef ARCH_PORTDUINO
+ #include "linux/LinuxHardwareI2C.h"
++#ifndef SIM_MESH
+ #include "mesh/raspihttp/PiWebServer.h"
++#else
++int rnode_idle_fd_ready(); // simradio-portduino: whether the last idle ended on a socket
++#endif
+ #include "platform/portduino/PortduinoGlue.h"
+ #include <cstdlib>
+ #include <fstream>
+@@ -377,6 +381,12 @@ void setup()
+ #if ARCH_PORTDUINO
+     RTCQuality ourQuality = RTCQualityDevice;
+ 
++#ifdef SIM_MESH
++    // The run's clock is the station's time source.
++    ourQuality = RTCQualityNTP;
++    struct timeval tv;
++    gettimeofday(&tv, NULL);
++#else
+     std::string timeCommandResult = exec("timedatectl status | grep synchronized | grep yes -c");
+     if (timeCommandResult[0] == '1') {
+         ourQuality = RTCQualityNTP;
+@@ -385,6 +395,7 @@ void setup()
+     struct timeval tv;
+     tv.tv_sec = time(NULL);
+     tv.tv_usec = 0;
++#endif
+     perhapsSetRTC(ourQuality, &tv);
+ #endif
+ 
+@@ -1020,7 +1031,7 @@ void setup()
+ #endif
+ 
+ #ifdef ARCH_PORTDUINO
+-#if __has_include(<ulfius.h>)
++#if __has_include(<ulfius.h>) && !defined(SIM_MESH)
+     if (portduino_config.webserverport != -1) {
+         piwebServerThread = new PiWebServerThread();
+         std::atexit([] { delete piwebServerThread; });
+@@ -1239,6 +1250,10 @@ void loop()
+         LOG_DEBUG("main loop delay: %d", delayMsec);
+ #endif
+         mainDelay.delay(delayMsec);
++#ifdef SIM_MESH
++        if (rnode_idle_fd_ready())
++            simMeshApiDue();
++#endif
+     }
+ }
+ #endif
+diff --git a/src/mesh/RadioLibInterface.cpp b/src/mesh/RadioLibInterface.cpp
+index 335e76a3b..af36acf1b 100644
+--- a/src/mesh/RadioLibInterface.cpp
++++ b/src/mesh/RadioLibInterface.cpp
+@@ -37,6 +37,21 @@ void LockingArduinoHal::spiTransfer(uint8_t *out, size_t len, uint8_t *in)
+ }
+ #endif
+ 
++#ifdef SIM_MESH
++void rnode_idle_radio(uint32_t max_ms); // simradio-portduino: ends on a DIO1 rise or a wake, not on input
++
++void LockingArduinoHal::yield()
++{
++    rnode_idle_radio(1);
++}
++
++void LockingArduinoHal::delayMicroseconds(RadioLibTime_t us)
++{
++    if (us >= 1000)
++        ArduinoHal::delayMicroseconds(us);
++}
++#endif
++
+ RadioLibInterface::RadioLibInterface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs, RADIOLIB_PIN_TYPE irq, RADIOLIB_PIN_TYPE rst,
+                                      RADIOLIB_PIN_TYPE busy, PhysicalLayer *_iface)
+     : NotifiedWorkerThread("RadioIf"), module(hal, cs, irq, rst, busy), iface(_iface)
+diff --git a/src/mesh/RadioLibInterface.h b/src/mesh/RadioLibInterface.h
+index cfbfbe1b5..dc736e20c 100644
+--- a/src/mesh/RadioLibInterface.h
++++ b/src/mesh/RadioLibInterface.h
+@@ -35,6 +35,12 @@ class LockingArduinoHal : public ArduinoHal
+     void spiTransfer(uint8_t *out, size_t len, uint8_t *in) override;
+ 
+ #endif
++#ifdef SIM_MESH
++    /// RadioLib's busy waits (channel activity detection) idle until DIO1 rises instead of spinning.
++    void yield() override;
++    /// The simulated chip is never busy: a sub-millisecond settling wait after a transfer takes no time.
++    void delayMicroseconds(RadioLibTime_t us) override;
++#endif
+ };
+ 
+ #if defined(USE_STM32WLx)
+diff --git a/src/mesh/api/ServerAPI.h b/src/mesh/api/ServerAPI.h
+index 2da77c8e9..369e3dd14 100644
+--- a/src/mesh/api/ServerAPI.h
++++ b/src/mesh/api/ServerAPI.h
+@@ -25,6 +25,11 @@ template <class T> class ServerAPI : public StreamAPI, private concurrency::OSTh
+     /// Check the current underlying physical link to see if the client is currently connected
+     virtual bool checkIsConnected() override;
+ 
++#ifdef SIM_MESH
++    /// Input waits on the socket: run now.
++    void simMeshDue() { setIntervalFromNow(0); }
++#endif
++
+   protected:
+     /// We override this method to prevent publishing EVENT_SERIAL_CONNECTED/DISCONNECTED for wifi links (we want the board to
+     /// stay in the POWERED state to prevent disabling wifi)
+@@ -54,6 +59,16 @@ template <class T, class U> class APIServerPort : public U, private concurrency:
+ 
+     void init();
+ 
++#ifdef SIM_MESH
++    /// Input waits on a socket, the listener's or the open connection's: both run now.
++    void simMeshDue()
++    {
++        setIntervalFromNow(0);
++        if (openAPI)
++            openAPI->simMeshDue();
++    }
++#endif
++
+   protected:
+     int32_t runOnce() override;
+ };
+diff --git a/src/mesh/api/WiFiServerAPI.cpp b/src/mesh/api/WiFiServerAPI.cpp
+index 4d729f5c7..33cdacc4a 100644
+--- a/src/mesh/api/WiFiServerAPI.cpp
++++ b/src/mesh/api/WiFiServerAPI.cpp
+@@ -23,6 +23,14 @@ void deInitApiServer()
+     }
+ }
+ 
++#ifdef SIM_MESH
++void simMeshApiDue()
++{
++    if (apiPort)
++        apiPort->simMeshDue();
++}
++#endif
++
+ WiFiServerAPI::WiFiServerAPI(WiFiClient &_client) : ServerAPI(_client)
+ {
+     api_type = TYPE_WIFI;
+diff --git a/src/mesh/api/WiFiServerAPI.h b/src/mesh/api/WiFiServerAPI.h
+index 5f2019983..22ce3ff5e 100644
+--- a/src/mesh/api/WiFiServerAPI.h
++++ b/src/mesh/api/WiFiServerAPI.h
+@@ -28,4 +28,7 @@ class WiFiServerPort : public APIServerPort<WiFiServerAPI, WiFiServer>
+ };
+ 
+ void initApiServer(int port = SERVER_API_DEFAULT_PORT);
+-void deInitApiServer();
+\ No newline at end of file
++void deInitApiServer();
++#ifdef SIM_MESH
++void simMeshApiDue();
++#endif
+\ No newline at end of file
+diff --git a/src/platform/portduino/PortduinoGlue.cpp b/src/platform/portduino/PortduinoGlue.cpp
+index bfa2f6efb..e09a65495 100644
+--- a/src/platform/portduino/PortduinoGlue.cpp
++++ b/src/platform/portduino/PortduinoGlue.cpp
+@@ -215,6 +215,10 @@ std::string cleanupNameForAutoconf(std::string name)
+     return name;
+ }
+ 
++/** A radio backend linked in (sim-mesh's simulated chip) installs its SPI chip and binds its
++ * pins here, after the configured pins and before SPI.begin(). */
++__attribute__((weak)) void native_radio_backend_init() {}
++
+ /** apps run under portduino can optionally define a portduinoSetup() to
+  * use portduino specific init code (such as gpioBind) to setup portduino on their host machine,
+  * before running 'arduino' code.
+@@ -669,6 +673,8 @@ void portduinoSetup()
+         }
+     }
+ 
++    native_radio_backend_init();
++
+     // Only initialize the radio pins when dealing with real, kernel controlled SPI hardware
+     if (portduino_config.lora_spi_dev != "" && portduino_config.lora_spi_dev != "ch341") {
+         SPI.begin(portduino_config.lora_spi_dev.c_str());
+diff --git a/variants/native/sim-mesh/platformio.ini b/variants/native/sim-mesh/platformio.ini
+new file mode 100644
+index 000000000..6aa9571ab
+--- /dev/null
++++ b/variants/native/sim-mesh/platformio.ini
+@@ -0,0 +1,16 @@
++; A sim-mesh station: meshtasticd with its SX1262 and pins on sim-mesh's
++; simulated chip (sim-mesh/radio/portduino) instead of spidev and libgpiod.
++[env:sim-mesh]
++extends = native_base
++build_flags = ${portduino_base.build_flags_common}
++  -I variants/native/portduino -li2c -lstdc++fs
++  -DHAS_SCREEN=0 -DMESHTASTIC_EXCLUDE_SCREEN=1 -DSIM_MESH=1
++  -Wl,--wrap=bind -Wl,--wrap=listen -Wl,--wrap=accept -Wl,--wrap=close
++build_src_filter = ${native_base.build_src_filter} -<graphics/Panel_sdl.cpp> -<graphics/TFTDisplay.cpp> -<mesh/raspihttp/>
++lib_deps = ${native_base.lib_deps}
++  simradio-portduino=symlink:///home/spangap/reticulous/sim-mesh/radio/portduino
++lib_ignore = ${portduino_base.lib_ignore}
++  LovyanGFX
++extra_scripts = ${env.extra_scripts}
++  pre:/home/spangap/reticulous/sim-mesh/radio/portduino/casefold.py
++  post:/home/spangap/reticulous/sim-mesh/radio/portduino/cross.py
