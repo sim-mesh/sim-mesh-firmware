@@ -1,9 +1,11 @@
 """A standard Reticulum node on sim-mesh: the `reticulum` driver.
 
-The zip holds station.py (the executable), the RNode firmware it starts
-(`rnode`, microReticulum_Firmware's Linux daemon built with
-`[env:sim-mesh-rnode]`, whose own stack is never started), and Reticulum and
-LXMF themselves under python/, which station.py runs on.
+The zip holds station.py (the executable), the RNode it starts (`rnode`:
+microReticulum_Firmware's Linux daemon built with `[env:sim-mesh-rnode]`,
+whose own stack is never started; or a directory holding Reticulous's or
+Sergeyculum's own sim-mesh firmware, whose stack keeps running beside the
+client), and Reticulum and LXMF themselves under python/, which station.py
+runs on.
 
 Two processes of a station join a virtual-time run: the RNode as the node's
 own id, which is the radio the loss tables know, and station.py as a station

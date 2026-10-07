@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
-"""A standard Reticulum node on sim-mesh: the RNode firmware as a Linux process,
-and Reticulum's Python reference implementation with an LXMF router behind
-it, as a person runs rnsd and an LXMF client on a computer with an RNode on
-its USB port.
+"""A standard Reticulum node on sim-mesh: an RNode's firmware as a Linux
+process, and Reticulum's Python reference implementation with an LXMF router
+behind it, as a person runs rnsd and an LXMF client on a computer with an
+RNode on its USB port.
 
-    station.py ── spawns ──► rnode        the RNode firmware, its KISS host port at
-                                          SIM_MESH_BIND_ADDR:7633, the chip model below
-    station.py ── RNodeInterface, tcp://SIM_MESH_BIND_ADDR ──► rnode
+    station.py ── spawns ──► the RNode     SR_RNODE
+    station.py ── RNodeInterface ──► the RNode
     testbed ── framed RPC on the console ──► station.py
+
+SR_RNODE is one of three RNodes:
+
+- a file: the RNode firmware (microReticulum_Firmware's daemon, its stack
+  never started), its KISS host port at SIM_MESH_BIND_ADDR:7633, the chip on
+  the pins below, configured by an rnoded.conf written at every start;
+- a directory holding Reticulous's Linux build and `rnode.json` (`kind`,
+  `exec`, `fixed`, `env`): its own stack keeps running beside the client, as
+  on a board, and its RNode endpoint is switched to TCP port 7633 on its
+  console, whose pty this process holds, at every start;
+- a directory holding Sergeyculum's Linux station and `rnode.json`: its
+  stack keeps running too, and RNodeInterface opens its KISS pty (`kiss` in
+  its directory) as a serial port.
+
+The two that are directories run in `rnode/`, their state under it.
 
 Both processes join a virtual-time run, each as a station of the ether's:
 the RNode as the node's own id (SR_RNODE_ID), which is the radio the loss
 tables know, and this process as its own id (SIM_MESH_NODE_ID), a station with
-no radio that reads the console. The ether then holds T for the KISS bytes
-between them as for any TCP between two stations.
+no radio that reads the console. The ether holds T for KISS bytes over TCP
+between them as for any TCP between two stations; it does not see a pty.
 
 Settings live in `state/settings.json`, and Reticulum and the router read
 them when this process starts: a `set` that changes one says so in `status`
@@ -47,12 +61,15 @@ or `lxmf: failed mid=o_… <why>`.
 import ctypes
 import json
 import os
+import pty
+import re
 import select
 import signal
 import subprocess
 import sys
 import threading
 import time
+import tty
 
 KISS_PORT = 7633
 RPC_MAGIC = b"\xf5\x53\x47\x01"
@@ -62,6 +79,9 @@ PR_SET_PDEATHSIG = 1
 IDENTITY_WAIT_S = 60.0      # how long a send waits for the recipient's identity
 PATH_ASK_S = 15.0           # and how often it asks for a path meanwhile
 LISTEN_POLL_S = 0.05
+QUERY_TIMEOUT_S = 2.0       # one framed query to Reticulous's console
+BOOT_POLL_S = 0.5           # how often Reticulous is asked whether it has booted
+BOOTED = re.compile(r"^\s*s\.sys\.reset_reason\s*=\s*\S", re.MULTILINE)
 SETTING_TYPES = {"name": str, "freq_hz": int, "bw_hz": int, "sf": int, "cr": int,
                  "txpower": int, "transport": int, "loglevel": int}
 RADIO_KEYS = ("freq_hz", "bw_hz", "sf", "cr", "txpower")
@@ -130,18 +150,189 @@ def die_with_parent():
     ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
 
 
+def query_id(command):
+    """A framed query's id, as sim-mesh's testbed derives it: 0x20..0xBF."""
+    h = 0
+    for ch in command:
+        h = (h * 31 + ord(ch)) & 0xFF
+    return 0x20 + h % 0xA0
+
+
+class RNode:
+    """The RNode's process, and the port RNodeInterface opens."""
+
+    def __init__(self, proc, port):
+        self.proc = proc
+        self.port = port
+
+    def ready(self):
+        raise NotImplementedError
+
+
+class StandardRNode(RNode):
+
+    def __init__(self, exe, addr):
+        node_id = os.environ["SR_RNODE_ID"]
+        conf = os.path.join(HERE, "rnoded.conf")
+        with open(conf, "w") as f:
+            f.write(rnode_conf(addr, node_id))
+        os.makedirs(os.path.join(STATE, "rnode"), exist_ok=True)
+        env = dict(os.environ, SIM_MESH_NODE_ID=node_id, MR_CONFIG=conf,
+                   MR_DATA_DIR=os.path.join(STATE, "rnode"),
+                   SIMRADIO_PIN_NSS="1", SIMRADIO_PIN_RESET="2",
+                   SIMRADIO_PIN_BUSY="3", SIMRADIO_PIN_DIO1="4")
+        proc = subprocess.Popen([exe], env=env, stdin=subprocess.DEVNULL,
+                                preexec_fn=die_with_parent)
+        super().__init__(proc, "tcp://%s" % addr)
+        self.addr = addr
+
+    def ready(self):
+        return listening(self.addr, KISS_PORT)
+
+
+def nested_env(firmware, spec, rdir):
+    """A nested firmware's environment: this station's, as the node's own id
+    in its own directory, and its node.yaml's `env`."""
+    env = dict(os.environ, SIM_MESH_NODE_ID=os.environ["SR_RNODE_ID"], SIM_MESH_NODE_DIR=rdir)
+    for key in ("PYTHONPATH", "SR_RNODE", "SR_RNODE_ID"):
+        env.pop(key, None)
+    for key, value in (spec.get("env") or {}).items():
+        value = str(value)
+        if value.startswith("./"):
+            value = os.path.join(firmware, value[2:])
+        if key == "LD_LIBRARY_PATH" and env.get(key):
+            value += ":" + env[key]
+        env[key] = value
+    return env
+
+
+class ReticulousRNode(RNode):
+    SETUP = ("set s.lora.rnode.serial 0", "set s.lora.rnode.tcp 1", "lora up")
+
+    def __init__(self, firmware, spec, addr):
+        rdir = os.path.join(HERE, "rnode")
+        os.makedirs(rdir, exist_ok=True)
+        env = nested_env(firmware, spec, rdir)
+        # FreeRTOS on hw-linux tells the ether when it is idle itself.
+        env.pop("SIM_MESH_IDLE", None)
+        env.update(SPANGAP_NODE_ID=os.environ["SR_RNODE_ID"], SPANGAP_NODE_DIR=rdir,
+                   SPANGAP_BIND_ADDR=addr, SPANGAP_ETHER=os.environ.get("SIM_MESH_ETHER", ""))
+        if spec.get("fixed"):
+            env["SPANGAP_FIXED_DIR"] = os.path.join(firmware, spec["fixed"])
+        if os.environ.get("SIM_MESH_BOARD"):
+            env["SPANGAP_BOARD"] = os.environ["SIM_MESH_BOARD"]
+        master, slave = pty.openpty()
+        tty.setraw(slave)
+        proc = subprocess.Popen([os.path.join(firmware, spec["exec"])], cwd=rdir, env=env,
+                                stdin=slave, stdout=slave, stderr=slave,
+                                preexec_fn=die_with_parent)
+        os.close(slave)
+        super().__init__(proc, "tcp://%s" % addr)
+        self.addr = addr
+        self.master = master
+        self.replies = {}
+        self.cond = threading.Condition()
+        self.set_up = False
+        threading.Thread(target=self.read, daemon=True).start()
+        threading.Thread(target=self.setup, daemon=True).start()
+
+    def read(self):
+        """Its console: replies to our frames taken out, every log line but
+        the framed-RPC marker passed on to ours."""
+        buf = text = b""
+        while True:
+            try:
+                data = os.read(self.master, 4096)
+            except InterruptedError:
+                continue
+            except OSError:
+                return
+            if not data:
+                return
+            buf += data
+            while buf:
+                at = buf.find(RPC_MAGIC)
+                if at < 0:
+                    keep = next((n for n in range(len(RPC_MAGIC) - 1, 0, -1)
+                                 if buf.endswith(RPC_MAGIC[:n])), 0)
+                    text += buf[:len(buf) - keep]
+                    buf = buf[len(buf) - keep:]
+                    break
+                text += buf[:at]
+                buf = buf[at:]
+                if len(buf) < RPC_HEADER:
+                    break
+                n = (buf[5] << 8) | buf[6]
+                if len(buf) < RPC_HEADER + n:
+                    break
+                with self.cond:
+                    self.replies[buf[4]] = buf[RPC_HEADER:RPC_HEADER + n].decode("utf-8",
+                                                                                 "replace")
+                    self.cond.notify_all()
+                buf = buf[RPC_HEADER + n:]
+            *lines, text = text.split(b"\n")
+            out = b"".join(line + b"\n" for line in lines if MARKER.encode() not in line)
+            if out:
+                emit(out)
+
+    def query(self, command):
+        """One framed command and its reply, or None when none came in time."""
+        fid = query_id(command)
+        payload = command.encode()
+        with self.cond:
+            self.replies.pop(fid, None)
+        os.write(self.master, RPC_MAGIC + bytes((fid, len(payload) >> 8, len(payload) & 0xFF))
+                 + payload)
+        deadline = time.monotonic() + QUERY_TIMEOUT_S
+        with self.cond:
+            while fid not in self.replies:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                self.cond.wait(left)
+            return self.replies.pop(fid)
+
+    def setup(self):
+        """Once its boot has run every service's init, which a setting typed
+        before it can be undone by: the RNode endpoint on TCP alone, and the
+        radio up."""
+        while not BOOTED.search(self.query("show s.sys.reset_reason") or ""):
+            time.sleep(BOOT_POLL_S)
+        for line in self.SETUP:
+            self.query(line)
+        self.set_up = True
+
+    def ready(self):
+        return self.set_up and listening(self.addr, KISS_PORT)
+
+
+class SergeyculumRNode(RNode):
+
+    def __init__(self, firmware, spec, addr):
+        rdir = os.path.join(HERE, "rnode")
+        os.makedirs(rdir, exist_ok=True)
+        kiss = os.path.join(rdir, "kiss")
+        if os.path.lexists(kiss):
+            os.unlink(kiss)
+        proc = subprocess.Popen([os.path.join(firmware, spec["exec"])], cwd=rdir,
+                                env=nested_env(firmware, spec, rdir),
+                                stdin=subprocess.DEVNULL, preexec_fn=die_with_parent)
+        super().__init__(proc, kiss)
+
+    def ready(self):
+        return os.path.exists(self.port)
+
+
+NESTED = {"reticulous": ReticulousRNode, "sergeyculum": SergeyculumRNode}
+
+
 def start_rnode(addr):
-    node_id = os.environ["SR_RNODE_ID"]
-    conf = os.path.join(HERE, "rnoded.conf")
-    with open(conf, "w") as f:
-        f.write(rnode_conf(addr, node_id))
-    os.makedirs(os.path.join(STATE, "rnode"), exist_ok=True)
-    env = dict(os.environ, SIM_MESH_NODE_ID=node_id, MR_CONFIG=conf,
-               MR_DATA_DIR=os.path.join(STATE, "rnode"),
-               SIMRADIO_PIN_NSS="1", SIMRADIO_PIN_RESET="2",
-               SIMRADIO_PIN_BUSY="3", SIMRADIO_PIN_DIO1="4")
-    return subprocess.Popen([os.environ["SR_RNODE"]], env=env, stdin=subprocess.DEVNULL,
-                            preexec_fn=die_with_parent)
+    path = os.environ["SR_RNODE"]
+    if not os.path.isdir(path):
+        return StandardRNode(path, addr)
+    with open(os.path.join(path, "rnode.json")) as f:
+        spec = json.load(f)
+    return NESTED[spec["kind"]](path, spec, addr)
 
 
 def listening(addr, port):
@@ -158,7 +349,7 @@ def listening(addr, port):
 
 # ---- Reticulum and LXMF ---------------------------------------------------------
 
-def rns_config(settings, addr):
+def rns_config(settings, port):
     radio = all(settings.get(key) is not None for key in RADIO_KEYS)
     text = ["[reticulum]",
             "  enable_transport = %s" % ("Yes" if settings.get("transport") else "No"),
@@ -171,7 +362,7 @@ def rns_config(settings, addr):
         text += ["  [[RNode LoRa]]",
                  "    type = RNodeInterface",
                  "    enabled = yes",
-                 "    port = tcp://%s" % addr,
+                 "    port = %s" % port,
                  "    frequency = %d" % settings["freq_hz"],
                  "    bandwidth = %d" % settings["bw_hz"],
                  "    txpower = %d" % settings["txpower"],
@@ -189,17 +380,17 @@ class Node:
         self.RNS = self.LXMF = None
         self.router = self.delivery = None
 
-    def start(self, addr):
+    def start(self, rnode):
         import RNS
         import LXMF
         self.RNS, self.LXMF = RNS, LXMF
         configdir = os.path.join(STATE, "rns")
         os.makedirs(configdir, exist_ok=True)
-        config, radio = rns_config(self.settings, addr)
+        config, radio = rns_config(self.settings, rnode.port)
         with open(os.path.join(configdir, "config"), "w") as f:
             f.write(config)
         if radio:
-            while not listening(addr, KISS_PORT):
+            while not rnode.ready():
                 time.sleep(LISTEN_POLL_S)
         RNS.logtimestamps = False
         RNS.Reticulum(configdir=configdir, loglevel=self.settings["loglevel"],
@@ -416,15 +607,15 @@ def main():
     console = Console(node, settings)
     emit((MARKER + "\n").encode())
     threading.Thread(target=console.run, daemon=True).start()
-    node.start(addr)
-    pidfd = os.pidfd_open(rnode.pid)
+    node.start(rnode)
+    pidfd = os.pidfd_open(rnode.proc.pid)
     while True:
         try:
             ready, _, _ = select.select([pidfd], [], [])
         except InterruptedError:
             continue
         if ready:
-            log("station: the RNode exited (%s)" % rnode.wait())
+            log("station: the RNode exited (%s)" % rnode.proc.wait())
             restart()
 
 
