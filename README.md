@@ -1,18 +1,31 @@
 # sim-mesh-firmware
 
 Everything that was specific to one firmware project, out of sim-mesh: each
-project's sim-mesh driver and the script that makes its firmware zip. Each
-belongs in its own project's repository; it waits here until it moves there.
-Two have: Reticulous's driver is `sim-mesh/driver.py` in the reticulous
-repository, and `spangap make-builds` makes its zip; Sergeyculum's driver and
-`make_zip.py` are in its `fw/sim-mesh/`, on the `feat/sim-mesh-firmware-zip`
-branch of `sergey/reticulum`.
+project's sim-mesh driver and the script that makes its firmware zip.
+
+The aim is that every firmware project builds and publishes its own sim-mesh
+zip, as one more build target beside its boards: its driver, its
+platform or variant for sim-mesh's virtual radio, and its packaging script
+in its own repository (or a fork of it, until upstream takes them), built
+and published with the project's releases. What is here waits until it
+moves there. Four have:
+
+| Firmware | Where | Zip from |
+|---|---|---|
+| Reticulous | the reticulous repository: driver `sim-mesh/driver.py` | `spangap make-builds hw-sim-mesh-<arch>` |
+| Sergeyculum | `sergey/reticulum`, branch `feat/sim-mesh-firmware-zip`: `fw/sim-mesh/` | `fw/sim-mesh/make_zip.py` |
+| MeshCore (companion, repeater, room server) | the fork `sim-mesh/MeshCore`, branch `sim-mesh`: a Linux (Portduino) platform under `src/helpers/portduino/` and the variant `variants/sim_mesh_sx1262/`, its driver and companion host in `sim/` | `variants/sim_mesh_sx1262/sim/make-zips` |
+| Meshtastic (meshtasticd) | the fork `sim-mesh/meshtastic` of `meshtastic/firmware`, branch `sim-mesh` on release 2.7.26: the source's `SIM_MESH` changes and the variant `variants/native/sim-mesh/`, its driver and API host in `sim/` | `variants/native/sim-mesh/sim/make-zips` |
+
+Each fork's branch holds what the project would need to build sim-mesh zips
+itself, and its variant's README says how to build them.
+
+Still here:
 
 | Directory | Firmware | Driver | Zip from |
 |---|---|---|---|
 | `standard-reticulum/` | Reticulum's Python reference with an LXMF router over an RNode (`station.py`) | `station.py`'s framed RPC; a flush restarts it | the RNode daemon built with `[env:sim-mesh-rnode]`, plus `rns` and `lxmf` from PyPI (`make_zip.py RNODE`) |
 | `microreticulum/` | attermann's microReticulum_Firmware daemon, `[env:sim-mesh]` | edits to `rnoded.conf` and a restart | the daemon (`make_zip.py DAEMON`; `--base`/`--mode` for a variant) |
-| `meshtastic/` | Meshtastic's Linux daemon, meshtasticd 2.7.26, `[env:sim-mesh]` from `firmware.patch`, with its API client (`host.py`) as a second, radio-less process of the station | `host.py`'s commands over framed RPC; settings in one transaction and the restart it brings | meshtasticd and the protobuf bindings generated from its own `protobufs` (`make_zip.py PROGRAM`) |
 | `old/` | what sim-mesh held before: its station kinds, compiled-build files, `station.py`, `devices.py`, the ESP-IDF radio glue and its link test, `NODE.md`, `STATION.md`, and their tests | | |
 
 Every station links sim-mesh's virtual radio by name (`-lsimradio-sx1262`,
@@ -28,25 +41,15 @@ station:
   `-e sim-mesh-jrl290` for the jrl290 stand-in). Portduino needs the
   headers of libuv, i2c-tools, libgpiod, yaml-cpp and libbsd
   (`libuv1-dev libi2c-dev libgpiod-dev libyaml-cpp-dev libbsd-dev`).
-- **Meshtastic**: sim-mesh's `radio/portduino/` too, in the
-  `competition/meshtastic_firmware` clone at tag `v2.7.26.54e0d8d` with
-  `meshtastic/firmware.patch` applied (`git apply`; it adds
-  `variants/native/sim-mesh/platformio.ini`): `pio run -e sim-mesh`, then
-  `meshtastic/make_zip.py .pio/build/sim-mesh/meshtasticd`. The other
-  architecture is the same build with the cross g++
-  (`radio/portduino/README.md`), into a build directory of its own:
-  `SIM_MESH_ARCH=x86_64 PLATFORMIO_BUILD_DIR=.pio/build-x86_64 pio run -e
-  sim-mesh`, then `make_zip.py .pio/build-x86_64/sim-mesh/meshtasticd`.
-  Besides Portduino's headers it needs `libssl-dev`, and for each
-  architecture it builds for, that architecture's `libyaml-cpp-dev`,
-  `libuv1-dev`, `libi2c-dev`, `libusb-1.0-0-dev`, `libssl-dev` and
-  `libgpiod-dev` (`:amd64` on an aarch64 host), since `make_zip.py` puts the
-  libraries meshtasticd loads beyond the C library and C++ runtime (yaml-cpp,
-  libusb, libi2c and theirs) in the zip's `lib/`, from that architecture's
-  multiarch directory. It takes the architecture from the program, and fetches
-  `grpcio-tools` and the pure-Python `protobuf` from PyPI. `test_host.py` and
-  `test_driver.py` run with sim-mesh's Python environment; the first builds
-  the bindings into `meshtastic/.pylib` once.
+- **Meshtastic**: sim-mesh's `radio/portduino/` too, in its fork's
+  `[env:sim-mesh]`: `pio run -e sim-mesh`, which `make-zips` runs for both
+  architectures (the other by its cross g++) before it packs them with the
+  libraries meshtasticd loads and the protobuf bindings.
+- **MeshCore**: its fork's Portduino platform with RadioLib over a HAL
+  that hands the radio whole SPI frames: `pio run -e
+  sim_mesh_sx1262_<role>` for `companion`, `repeater` and `room`, which
+  `make-zips` runs for both architectures (the other by its cross g++)
+  before it packs them.
 - **Sergeyculum**: its `sim-mesh-radio-sys` crate links it by name;
   `cargo build --profile sim` in `fw/sim-mesh`, and
   `cargo build --release -p rncfg` at the top, then its
